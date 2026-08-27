@@ -2,19 +2,29 @@
 """
 Bot de veille logements CROUS - Béthune (62400)
 -------------------------------------------------
-Scrape trouverunlogement.lescrous.fr (année en cours + année prochaine),
-filtre les logements dont l'adresse contient "BETHUNE" ou "62400",
-et envoie une notification Discord (via webhook) uniquement pour les
-NOUVEAUX logements (pas déjà vus lors du dernier passage).
+Scrape trouverunlogement.lescrous.fr (année 2026-2027), parcourt toutes les
+pages de résultats, et envoie une notification Discord UNIQUEMENT quand :
+  - un logement à Béthune devient disponible (ping + détails)
+  - un logement à Béthune n'est plus disponible (ping + durée de dispo)
+
+Aucun message périodique / résumé n'est envoyé — silence total sinon.
+
+Anti-saturation : si le site répond avec un nombre de résultats anormalement
+bas (souvent le signe d'une page mal chargée / site surchargé), le script
+réessaie plusieurs fois avant de faire confiance à la réponse. S'il n'arrive
+toujours pas à obtenir une réponse fiable, il NE TOUCHE PAS à l'état existant
+(pas de fausse alerte "logement disparu") et retentera au prochain cycle.
 
 Usage:
-    python check_crous.py
+    python check_crous.py            # une seule exécution
+    python check_crous.py --loop 30  # boucle continue toutes les 30s
 
-Variables d'environnement requises:
-    DISCORD_WEBHOOK_URL   -> URL du webhook Discord (voir README.md)
+Variables d'environnement:
+    DISCORD_WEBHOOK_URL   -> URL du webhook Discord (obligatoire pour notifier)
+    DISCORD_USER_ID       -> ton ID Discord numérique (optionnel, pour le ping)
 
 Fichier d'état:
-    seen.json  -> liste des IDs de logements déjà notifiés (créé automatiquement)
+    seen.json -> {"<id_logement>": <timestamp_epoch_premiere_detection>, ...}
 """
 
 import os
@@ -36,6 +46,12 @@ SEARCH_URLS = [
 # Mots-clés qui déclenchent un "match Béthune" (insensible à la casse)
 KEYWORDS = ["BETHUNE", "BÉTHUNE", "62400"]
 
+# En-dessous de ce total France, on considère la réponse comme suspecte
+# (site saturé / page mal chargée) plutôt que comme un vrai changement.
+MIN_EXPECTED_FRANCE = 10
+MAX_FETCH_RETRIES = 4
+RETRY_DELAY_SECONDS = 12
+
 STATE_FILE = os.path.join(os.path.dirname(__file__), "seen.json")
 WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "").strip()
 DISCORD_USER_ID = os.environ.get("DISCORD_USER_ID", "").strip()
@@ -43,7 +59,6 @@ DISCORD_USER_ID = os.environ.get("DISCORD_USER_ID", "").strip()
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                   "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
-    # On force une vraie requête fraîche à chaque fois, pas de version en cache
     "Cache-Control": "no-cache, no-store, must-revalidate",
     "Pragma": "no-cache",
 }
@@ -52,10 +67,10 @@ HEADERS = {
 
 def fetch_listings(label, base_url):
     """Récupère et parse TOUS les logements d'une recherche CROUS, en parcourant
-    automatiquement toutes les pages de résultats (pas seulement la première)."""
+    automatiquement toutes les pages de résultats."""
     listings = []
     page = 1
-    max_pages = 30  # garde-fou pour ne jamais boucler à l'infini
+    max_pages = 30
 
     while page <= max_pages:
         cache_buster = {"page": page, "_": str(int(time.time() * 1000))}
@@ -106,7 +121,6 @@ def fetch_listings(label, base_url):
             found_on_page += 1
 
         if found_on_page == 0:
-            # Page vide -> on a dépassé la dernière page, on arrête.
             break
 
         page += 1
@@ -114,83 +128,117 @@ def fetch_listings(label, base_url):
     return listings
 
 
+def fetch_all_france():
+    """Récupère tous les logements France, avec retry si la réponse semble
+    suspecte (site saturé). Retourne None si aucune réponse fiable obtenue
+    après plusieurs tentatives (le cycle appelant doit alors ne RIEN changer)."""
+    for attempt in range(1, MAX_FETCH_RETRIES + 1):
+        try:
+            all_france = []
+            for label, url in SEARCH_URLS:
+                all_france.extend(fetch_listings(label, url))
+
+            if len(all_france) >= MIN_EXPECTED_FRANCE:
+                return all_france
+
+            print(f"⚠️  Réponse suspecte ({len(all_france)} logements, "
+                  f"tentative {attempt}/{MAX_FETCH_RETRIES}) — site probablement saturé.")
+
+        except requests.RequestException as e:
+            print(f"⚠️  Erreur réseau (tentative {attempt}/{MAX_FETCH_RETRIES}): {e}", file=sys.stderr)
+
+        if attempt < MAX_FETCH_RETRIES:
+            time.sleep(RETRY_DELAY_SECONDS)
+
+    print("❌ Impossible d'obtenir une réponse fiable — état précédent conservé, "
+          "on retentera au prochain cycle.", file=sys.stderr)
+    return None
+
+
 def filter_bethune(listings):
-    matches = []
-    for item in listings:
-        haystack = item["text"].upper()
-        if any(kw in haystack for kw in KEYWORDS):
-            matches.append(item)
-    return matches
+    return [item for item in listings if any(kw in item["text"].upper() for kw in KEYWORDS)]
 
 
-# ---- État (déjà vu) ------------------------------------------------------
+# ---- État (déjà vu) : {id: timestamp epoch de première détection} --------
 
 def load_seen():
     if os.path.exists(STATE_FILE):
         with open(STATE_FILE, "r", encoding="utf-8") as f:
-            return set(json.load(f))
-    return set()
+            data = json.load(f)
+        if isinstance(data, list):
+            # Ancien format (liste d'IDs) -> migration douce
+            now = time.time()
+            return {item_id: now for item_id in data}
+        return data
+    return {}
 
 
-def save_seen(seen_ids):
+def save_seen(seen_dict):
     with open(STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump(sorted(seen_ids), f, ensure_ascii=False, indent=2)
+        json.dump(seen_dict, f, ensure_ascii=False, indent=2)
+
+
+def format_duration(seconds):
+    seconds = int(seconds)
+    days, rem = divmod(seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, _ = divmod(rem, 60)
+    parts = []
+    if days:
+        parts.append(f"{days}j")
+    if hours:
+        parts.append(f"{hours}h")
+    if minutes or not parts:
+        parts.append(f"{minutes}min")
+    return " ".join(parts)
 
 
 # ---- Discord --------------------------------------------------------------
 
-def send_summary(all_france_count, bethune_count):
-    """Envoie le résumé (total France 2026-2027 + total Béthune) — à chaque check."""
+def _post(payload):
     if not WEBHOOK_URL:
-        print(f"⚠️  DISCORD_WEBHOOK_URL non défini — résumé: {all_france_count} France / {bethune_count} Béthune")
+        print(f"⚠️  DISCORD_WEBHOOK_URL non défini — message non envoyé: {payload.get('content','')}")
         return
-
-    payload = {
-        "username": "CROUS Béthune Watcher",
-        "embeds": [{
-            "title": "📊 Résumé du check (2026-2027)",
-            "description": (
-                f"**{all_france_count}** logements au total en France\n"
-                f"**{bethune_count}** logements à Béthune actuellement"
-            ),
-            "color": 0x3498DB,
-        }],
-    }
     r = requests.post(WEBHOOK_URL, json=payload, timeout=15)
     if r.status_code >= 300:
-        print(f"Erreur envoi Discord (résumé) ({r.status_code}): {r.text}", file=sys.stderr)
+        print(f"Erreur envoi Discord ({r.status_code}): {r.text}", file=sys.stderr)
 
 
-def notify_new_bethune(new_items):
-    """Envoie une carte détaillée + PING pour chaque nouveau logement à Béthune."""
-    if not WEBHOOK_URL:
-        print("⚠️  DISCORD_WEBHOOK_URL non défini — affichage console uniquement.")
-        for item in new_items:
-            print(f"- [{item['year']}] {item['name']} ({item['price']}) -> {item['url']}")
-        return
+def notify_became_available(item):
+    ping = f"<@{DISCORD_USER_ID}> " if DISCORD_USER_ID else ""
+    _post({
+        "username": "CROUS Béthune Watcher",
+        "content": f"{ping}🚨 Nouveau logement disponible à Béthune !",
+        "embeds": [{
+            "title": f"🏠 Disponible ({item['year']})",
+            "description": item["name"],
+            "url": item["url"],
+            "color": 0x2ECC71,
+            "fields": [
+                {"name": "Adresse", "value": item["address"], "inline": False},
+                {"name": "Prix", "value": item["price"], "inline": True},
+                {"name": "Surface", "value": item["surface"], "inline": True},
+                {"name": "Lien", "value": item["url"], "inline": False},
+            ],
+        }],
+    })
 
-    ping = f"<@{DISCORD_USER_ID}>" if DISCORD_USER_ID else ""
 
-    for item in new_items:
-        payload = {
-            "username": "CROUS Béthune Watcher",
-            "content": f"{ping} 🚨 Nouveau logement dispo à Béthune !" if ping else "🚨 Nouveau logement dispo à Béthune !",
-            "embeds": [{
-                "title": f"🏠 Nouveau logement à Béthune ({item['year']})",
-                "description": item["name"],
-                "url": item["url"],
-                "color": 0xE74C3C,
-                "fields": [
-                    {"name": "Adresse", "value": item["address"], "inline": False},
-                    {"name": "Prix", "value": item["price"], "inline": True},
-                    {"name": "Surface", "value": item["surface"], "inline": True},
-                    {"name": "Lien", "value": item["url"], "inline": False},
-                ],
-            }],
-        }
-        r = requests.post(WEBHOOK_URL, json=payload, timeout=15)
-        if r.status_code >= 300:
-            print(f"Erreur envoi Discord ({r.status_code}): {r.text}", file=sys.stderr)
+def notify_became_unavailable(item, duration_seconds):
+    ping = f"<@{DISCORD_USER_ID}> " if DISCORD_USER_ID else ""
+    _post({
+        "username": "CROUS Béthune Watcher",
+        "content": f"{ping}❌ Logement à Béthune plus disponible (resté dispo {format_duration(duration_seconds)}).",
+        "embeds": [{
+            "title": f"Logement retiré ({item.get('year','?')})",
+            "description": item.get("name", "?"),
+            "color": 0xE74C3C,
+            "fields": [
+                {"name": "Était disponible pendant", "value": format_duration(duration_seconds), "inline": False},
+                {"name": "Adresse", "value": item.get("address", "?"), "inline": False},
+            ],
+        }],
+    })
 
 
 # ---- Main -----------------------------------------------------------------
@@ -200,54 +248,53 @@ def print_details(items, title):
     if not items:
         print("  (aucun)")
     for item in items:
-        print(f"- {item['name']} [{item['year']}]")
-        print(f"    Adresse : {item['address']}")
-        print(f"    Prix    : {item['price']}")
-        print(f"    Surface : {item['surface']}")
-        print(f"    Lien    : {item['url']}")
+        print(f"- {item['name']} [{item['year']}] | {item['address']} | {item['price']} | {item['surface']} | {item['url']}")
 
 
 def run_once():
-    seen = load_seen()
-    all_france = []
+    all_france = fetch_all_france()
 
-    for label, url in SEARCH_URLS:
-        try:
-            listings = fetch_listings(label, url)
-        except requests.RequestException as e:
-            print(f"Erreur en récupérant {url}: {e}", file=sys.stderr)
-            continue
-        all_france.extend(listings)
+    if all_france is None:
+        # Réponse non fiable -> on ne touche à rien, pas de fausse alerte.
+        print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Cycle ignoré (réponse non fiable).")
+        return
 
     bethune = filter_bethune(all_france)
+    print(f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] Total France: {len(all_france)} | Total Béthune: {len(bethune)}")
+    print_details(bethune, "Logements à BÉTHUNE actuellement")
 
-    current_ids = {item["id"] for item in bethune}
-    new_items = [item for item in bethune if item["id"] not in seen]
+    seen = load_seen()  # {id: first_seen_epoch}
+    current_by_id = {item["id"]: item for item in bethune}
 
-    print(f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] "
-          f"Total France (2026-2027): {len(all_france)} | Total Béthune: {len(bethune)} | Nouveaux Béthune: {len(new_items)}")
+    new_ids = set(current_by_id) - set(seen)
+    gone_ids = set(seen) - set(current_by_id)
 
-    print_details(all_france, "TOUS les logements en France (2026-2027)")
-    print_details(bethune, "Logements à BÉTHUNE")
+    now = time.time()
 
-    # Résumé envoyé à CHAQUE check
-    send_summary(len(all_france), len(bethune))
+    for item_id in new_ids:
+        item = current_by_id[item_id]
+        print(f"NOUVEAU: {item['name']} ({item_id})")
+        notify_became_available(item)
+        seen[item_id] = now
 
-    # Ping + carte détaillée uniquement pour les NOUVEAUX logements à Béthune
-    if new_items:
-        print_details(new_items, "Dont NOUVEAUX à Béthune depuis le dernier check")
-        notify_new_bethune(new_items)
+    for item_id in gone_ids:
+        first_seen = seen.get(item_id, now)
+        duration = now - first_seen
+        print(f"DISPARU: {item_id} — resté dispo {format_duration(duration)}")
+        # On n'a plus le détail complet (le logement n'est plus dans la page),
+        # on envoie ce qu'on sait à minima.
+        notify_became_unavailable({"id": item_id, "year": item_id.split(":")[0]}, duration)
+        del seen[item_id]
 
-    save_seen(current_ids)
+    save_seen(seen)
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--loop", type=int, default=0,
-        help="Si fourni, tourne en continu et refait un check toutes les N secondes "
-             "(ex: --loop 120 pour toutes les 2 minutes). Sans cet argument, "
-             "le script s'exécute une seule fois et s'arrête (mode 'cron externe')."
+        help="Si fourni, tourne en continu toutes les N secondes. "
+             "Sans cet argument, une seule exécution."
     )
     args = parser.parse_args()
 
@@ -257,7 +304,6 @@ def main():
             try:
                 run_once()
             except Exception as e:
-                # On ne veut jamais que la boucle s'arrête à cause d'une erreur ponctuelle
                 print(f"Erreur inattendue: {e}", file=sys.stderr)
             time.sleep(args.loop)
     else:
